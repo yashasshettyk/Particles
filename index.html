@@ -143,7 +143,8 @@
     color:var(--text-hi); min-width:2.4vw; text-align:right;
   }
 
-  select#quality{
+  select#quality,
+  select#audioSource{
     background:rgba(255,255,255,0.06);
     border:1px solid var(--panel-border);
     color:var(--text-hi);
@@ -153,7 +154,8 @@
     border-radius:calc(var(--radius)*0.5);
     outline:none; cursor:pointer;
   }
-  select#quality option{ background:#0a0b0f; color:var(--text-hi); }
+  select#quality option,
+  select#audioSource option{ background:#0a0b0f; color:var(--text-hi); }
 
   .icon-btn{
     display:flex; align-items:center; justify-content:center;
@@ -208,6 +210,16 @@
       <option value="medium">Medium</option>
       <option value="high" selected>High</option>
       <option value="ultra">Ultra · 8K</option>
+    </select>
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="grp">
+    <div class="grp-label">Audio</div>
+    <select id="audioSource">
+      <option value="off" selected>Off</option>
+      <option value="mic">Microphone</option>
     </select>
   </div>
 
@@ -291,11 +303,131 @@
     return c;
   }
 
+  function updatePointer(clientX, clientY){
+    var w = Math.max(window.innerWidth, 1);
+    var h = Math.max(window.innerHeight, 1);
+    pointer.targetX = (clientX / w) * 2 - 1;
+    pointer.targetY = (clientY / h) * 2 - 1;
+    pointer.active = true;
+  }
+
+  function stopAudio(){
+    audioState.enabled = false;
+    audioState.ready = false;
+    audioState.level = 0;
+    audioState.smoothLevel = 0;
+    audioState.bands = new Float32Array(24);
+    if (audioState.source && audioState.source.disconnect){
+      try{ audioState.source.disconnect(); }catch(e){}
+    }
+    if (audioState.analyser && audioState.analyser.disconnect){
+      try{ audioState.analyser.disconnect(); }catch(e){}
+    }
+    if (audioState.stream){
+      audioState.stream.getTracks().forEach(function(track){ track.stop(); });
+    }
+    if (audioState.context && audioState.context.state !== 'closed'){
+      try{ audioState.context.close(); }catch(e){}
+    }
+    audioState.context = null;
+    audioState.analyser = null;
+    audioState.source = null;
+    audioState.stream = null;
+    audioState.fft = null;
+  }
+
+  function startAudio(){
+    if (audioState.ready || audioState.enabled) return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+
+    var AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return;
+
+    var context = new AudioContextClass();
+    var analyser = context.createAnalyser();
+    analyser.fftSize = 128;
+    analyser.smoothingTimeConstant = 0.86;
+    analyser.minDecibels = -90;
+    analyser.maxDecibels = -12;
+
+    navigator.mediaDevices.getUserMedia({ audio: true, video: false }).then(function(stream){
+      var source = context.createMediaStreamSource(stream);
+      source.connect(analyser);
+      audioState.context = context;
+      audioState.analyser = analyser;
+      audioState.source = source;
+      audioState.stream = stream;
+      audioState.fft = new Uint8Array(analyser.frequencyBinCount);
+      audioState.enabled = true;
+      audioState.ready = true;
+      var audioSel = document.getElementById('audioSource');
+      if (audioSel) audioSel.value = 'mic';
+      if (context.state === 'suspended' && context.resume){
+        context.resume();
+      }
+    }).catch(function(){
+      stopAudio();
+      var audioSel = document.getElementById('audioSource');
+      if (audioSel) audioSel.value = 'off';
+    });
+  }
+
+  function refreshAudio(){
+    if (!audioState.enabled || !audioState.analyser || !audioState.fft) {
+      audioState.level = 0;
+      audioState.smoothLevel = lerp(audioState.smoothLevel, 0, 0.08);
+      return;
+    }
+
+    audioState.analyser.getByteFrequencyData(audioState.fft);
+    var sum = 0;
+    var bandCount = audioState.bands.length;
+    var step = Math.max(1, Math.floor(audioState.fft.length / bandCount));
+
+    for (var i = 0; i < bandCount; i++){
+      var total = 0;
+      var count = 0;
+      var start = i * step;
+      var end = Math.min(start + step, audioState.fft.length);
+      for (var j = start; j < end; j++){
+        total += audioState.fft[j];
+        count++;
+      }
+      var bandValue = count ? total / (count * 255) : 0;
+      audioState.bands[i] = lerp(audioState.bands[i], bandValue, 0.18);
+      sum += audioState.bands[i];
+    }
+
+    audioState.level = sum / bandCount;
+    audioState.smoothLevel = lerp(audioState.smoothLevel, audioState.level, 0.08);
+  }
+
   var activeGroup = new THREE.Group();
   scene.add(activeGroup);
   var activeUpdate = null;
   var activeBgTint = new THREE.Color(0x020203);
   var activeFogDensity = 0.0016;
+
+  var pointer = {
+    x: 0,
+    y: 0,
+    targetX: 0,
+    targetY: 0,
+    active: false
+  };
+
+  var audioState = {
+    enabled: false,
+    ready: false,
+    level: 0,
+    smoothLevel: 0,
+    bands: new Float32Array(24),
+    fft: null,
+    context: null,
+    analyser: null,
+    source: null,
+    stream: null
+  };
 
   function clearActive(){
     while(activeGroup.children.length){
@@ -623,16 +755,155 @@
     };
   }
 
+  // ---------- PULSE ----------
+  function buildPulse(baseCount){
+    var n = Math.round(clamp(baseCount*0.55, 3200, 7800));
+    var pos = new Float32Array(n*3);
+    var col = new Float32Array(n*3);
+    var dirX = new Float32Array(n);
+    var dirY = new Float32Array(n);
+    var dirZ = new Float32Array(n);
+    var baseR = new Float32Array(n);
+    var phase = new Float32Array(n);
+    var bandIndex = new Uint8Array(n);
+    var phiInc = Math.PI * (3 - Math.sqrt(5));
+
+    for (var i=0;i<n;i++){
+      var y = 1 - (i / Math.max(1, n - 1)) * 2;
+      var r = Math.sqrt(Math.max(0, 1 - y * y));
+      var theta = phiInc * i;
+      dirX[i] = Math.cos(theta) * r;
+      dirY[i] = y;
+      dirZ[i] = Math.sin(theta) * r;
+      baseR[i] = rand(42, 120);
+      phase[i] = rand(0, Math.PI * 2);
+      bandIndex[i] = i % audioState.bands.length;
+      pos[i*3] = dirX[i] * baseR[i];
+      pos[i*3+1] = dirY[i] * baseR[i];
+      pos[i*3+2] = dirZ[i] * baseR[i];
+      var c = hsl(0.56 + y * 0.08, 0.8, 0.55 + y * 0.08);
+      col[i*3] = c.r;
+      col[i*3+1] = c.g;
+      col[i*3+2] = c.b;
+    }
+
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos,3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col,3));
+    var mat = new THREE.PointsMaterial({
+      size:2.15, map:spriteTex, vertexColors:true, transparent:true,
+      depthWrite:false, blending:THREE.AdditiveBlending, opacity:1, sizeAttenuation:true
+    });
+    var points = new THREE.Points(geo, mat);
+    activeGroup.add(points);
+
+    return {
+      material:mat,
+      update:function(t,dt,speed){
+        var arr = geo.attributes.position.array;
+        var smoothLevel = audioState.smoothLevel;
+        var audioBands = audioState.bands;
+        var sway = t * (0.28 + smoothLevel * 0.25) * speed;
+        var pointerX = pointer.x;
+        var pointerY = pointer.y;
+        for (var i=0;i<n;i++){
+          var band = audioBands[bandIndex[i]] || smoothLevel;
+          var breath = 1 + smoothLevel * 24 + band * 34;
+          var wobble = Math.sin(t * 0.9 + phase[i]) * (2.5 + band * 7.0);
+          var twirl = sway + phase[i] + i * 0.0007;
+          var axial = baseR[i] + breath + wobble;
+          var px = dirX[i] * axial;
+          var py = dirY[i] * axial;
+          var pz = dirZ[i] * axial;
+          px += Math.sin(twirl + dirY[i] * 3.0) * (6 + band * 10);
+          py += Math.cos(twirl + dirX[i] * 4.0) * (6 + band * 10);
+          pz += Math.sin(twirl + dirZ[i] * 5.0) * (6 + band * 10);
+          px += pointerX * 26 * (1 - Math.abs(dirY[i]));
+          py += -pointerY * 18 * (1 - Math.abs(dirX[i]));
+          arr[i*3] = px;
+          arr[i*3+1] = py;
+          arr[i*3+2] = pz;
+        }
+        geo.attributes.position.needsUpdate = true;
+        points.rotation.y = lerp(points.rotation.y, pointerX * 0.3, 0.03);
+        points.rotation.x = lerp(points.rotation.x, -pointerY * 0.12, 0.03);
+      }
+    };
+  }
+
+  // ---------- FLOW ----------
+  function buildFlow(baseCount){
+    var n = Math.round(baseCount * 0.58);
+    var pos = new Float32Array(n*3);
+    var col = new Float32Array(n*3);
+    var radius = new Float32Array(n);
+    var phase = new Float32Array(n);
+    var lane = new Float32Array(n);
+    var speed = new Float32Array(n);
+    var zSeed = new Float32Array(n);
+
+    for (var i=0;i<n;i++){
+      radius[i] = rand(6, 52);
+      phase[i] = rand(0, Math.PI * 2);
+      lane[i] = rand(-1, 1);
+      speed[i] = rand(0.45, 1.55);
+      zSeed[i] = rand(-220, 220);
+      pos[i*3] = 0;
+      pos[i*3+1] = 0;
+      pos[i*3+2] = zSeed[i];
+      var c = hsl(0.58 + lane[i] * 0.05, 0.7, 0.62);
+      col[i*3] = c.r;
+      col[i*3+1] = c.g;
+      col[i*3+2] = c.b;
+    }
+
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos,3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col,3));
+    var mat = new THREE.PointsMaterial({
+      size:2.0, map:spriteTex, vertexColors:true, transparent:true,
+      depthWrite:false, blending:THREE.AdditiveBlending, opacity:1, sizeAttenuation:true
+    });
+    var points = new THREE.Points(geo, mat);
+    activeGroup.add(points);
+
+    return {
+      material:mat,
+      update:function(t,dt,globalSpeed){
+        var arr = geo.attributes.position.array;
+        var px = pointer.x;
+        var py = pointer.y;
+        var cursorPull = 18 + Math.abs(px) * 10;
+        for (var i=0;i<n;i++){
+          var s = speed[i] * globalSpeed;
+          phase[i] += dt * s * (0.7 + Math.abs(lane[i]) * 0.35);
+          zSeed[i] += dt * (52 + s * 90);
+          if (zSeed[i] > 240){ zSeed[i] = -240; phase[i] += 1.5; }
+          var wave = Math.sin(phase[i] + t * 0.45 + lane[i] * 2.0);
+          var wave2 = Math.cos(phase[i] * 0.9 - t * 0.32 + lane[i] * 1.2);
+          arr[i*3] = wave * radius[i] + px * cursorPull * (0.65 + lane[i] * 0.15);
+          arr[i*3+1] = wave2 * radius[i] * 0.65 - py * cursorPull * 0.4;
+          arr[i*3+2] = zSeed[i] + Math.sin(t * 0.25 + phase[i]) * 18;
+        }
+        geo.attributes.position.needsUpdate = true;
+        points.rotation.z = lerp(points.rotation.z, -px * 0.22, 0.03);
+        points.rotation.x = lerp(points.rotation.x, py * 0.16, 0.03);
+      }
+    };
+  }
+
   /* ============================================================
      MODE REGISTRY
   ============================================================ */
   var MODES = [
+    { key:'pulse',         name:'Pulse',         glyph:'◉', build:buildPulse,         base:9800,  cam:210, fog:0.0014, bg:0x04040a },
     { key:'galaxy',        name:'Galaxy',        glyph:'✦', build:buildGalaxy,        base:11000, cam:260, fog:0.0015, bg:0x050308 },
     { key:'nebula',        name:'Nebula',        glyph:'❄', build:buildNebula,        base:8000,  cam:220, fog:0.0020, bg:0x08040a },
     { key:'sphere',        name:'Sphere',        glyph:'◯', build:buildSphere,        base:9000,  cam:230, fog:0.0014, bg:0x020508 },
+    { key:'flow',          name:'Flow',          glyph:'≈', build:buildFlow,          base:9200,  cam:200, fog:0.0017, bg:0x020306 },
     { key:'warp',          name:'Warp',          glyph:'≫', build:buildWarp,          base:11000, cam:0,   fog:0.0000, bg:0x000000 },
     { key:'aurora',        name:'Aurora',        glyph:'∿', build:buildAurora,        base:9000,  cam:140, fog:0.0022, bg:0x020604 },
-    { key:'constellation', name:'Constellation',  glyph:'∴', build:buildConstellation, base:9000,  cam:240, fog:0.0012, bg:0x020204 }
+    { key:'constellation', name:'Constellation', glyph:'∴', build:buildConstellation, base:9000,  cam:240, fog:0.0012, bg:0x020204 }
   ];
   var modeByKey = {};
   MODES.forEach(function(m){ modeByKey[m.key]=m; });
@@ -679,7 +950,7 @@
     var m = obj.material, target = (m.userData && m.userData.baseOpacity) || m.opacity || 1;
     var start = performance.now();
     var from = 0;
-    var wantOpacity = { galaxy:1, nebula:0.9, sphere:1, warp:1, aurora:0.95, constellation:1 }[currentKey] || 1;
+    var wantOpacity = { pulse:1, galaxy:1, nebula:0.9, sphere:1, flow:1, warp:1, aurora:0.95, constellation:1 }[currentKey] || 1;
     (function step(){
       var p = clamp((performance.now()-start)/500, 0, 1);
       m.opacity = lerp(0, wantOpacity, p);
@@ -730,6 +1001,13 @@
     saveState();
   });
 
+  var audioSel = document.getElementById('audioSource');
+  audioSel.addEventListener('change', function(){
+    if (audioSel.value === 'mic') startAudio();
+    else stopAudio();
+    saveState();
+  });
+
   document.getElementById('fsBtn').addEventListener('click', function(){
     toggleFullscreen(); wake();
   });
@@ -747,7 +1025,7 @@
   function saveState(){
     try{
       localStorage.setItem('aether_state', JSON.stringify({
-        mode: currentKey, speed: globalSpeed, quality: currentQuality
+        mode: currentKey, speed: globalSpeed, quality: currentQuality, audio: audioSel ? audioSel.value : 'off'
       }));
     }catch(e){}
   }
@@ -782,11 +1060,19 @@
     document.body.classList.add('idle');
   }
 
-  ['mousemove','mousedown','touchstart','keydown'].forEach(function(ev){
+  ['mousemove','mousedown','touchstart','touchmove','keydown'].forEach(function(ev){
     window.addEventListener(ev, function(e){
       wake();
+      if (e.touches && e.touches.length){
+        updatePointer(e.touches[0].clientX, e.touches[0].clientY);
+      } else if (typeof e.clientX === 'number' && typeof e.clientY === 'number'){
+        updatePointer(e.clientX, e.clientY);
+      }
+      if (audioSel && audioSel.value === 'mic' && !audioState.enabled && !audioState.ready){
+        startAudio();
+      }
       if (ev==='keydown') handleKey(e);
-    }, {passive:true});
+    }, {passive: ev !== 'keydown'});
   });
 
   function handleKey(e){
@@ -820,10 +1106,11 @@
     globalSpeed = clamp(saved.speed || 1, 0.1, 2.0);
     speedSlider.value = Math.round(globalSpeed*100);
     updateSpeedLabel();
-    switchMode(MODES.some(function(m){return m.key===saved.mode;}) ? saved.mode : 'galaxy', true);
+    audioSel.value = saved.audio === 'mic' ? 'mic' : 'off';
+    switchMode(MODES.some(function(m){return m.key===saved.mode;}) ? saved.mode : 'pulse', true);
   } else {
     updateSpeedLabel();
-    switchMode('galaxy', true);
+    switchMode('pulse', true);
   }
 
   /* ============================================================
@@ -835,14 +1122,23 @@
     var dt = Math.min(clock.getDelta(), 0.05);
     var t = clock.getElapsedTime();
 
+    pointer.x = lerp(pointer.x, pointer.targetX, 0.08);
+    pointer.y = lerp(pointer.y, pointer.targetY, 0.08);
+    refreshAudio();
+
     if (current && current.update) current.update(t, dt, globalSpeed);
 
     // gentle ambient camera drift
     var driftAmp = (currentKey==='warp') ? 4 : 14;
-    camera.position.x = Math.sin(t*0.05) * driftAmp;
-    camera.position.y = Math.cos(t*0.07) * driftAmp * 0.6;
+    var cursorX = pointer.x * 18;
+    var cursorY = -pointer.y * 12;
+    camera.position.x = lerp(camera.position.x, Math.sin(t*0.05) * driftAmp + cursorX, 0.04);
+    camera.position.y = lerp(camera.position.y, Math.cos(t*0.07) * driftAmp * 0.6 + cursorY, 0.04);
     camera.position.z = lerp(camera.position.z, camTargetZ, 0.02);
     camera.lookAt(0,0,0);
+
+    activeGroup.rotation.y = lerp(activeGroup.rotation.y, pointer.x * 0.28, 0.02);
+    activeGroup.rotation.x = lerp(activeGroup.rotation.x, -pointer.y * 0.12, 0.02);
 
     fog.density = lerp(fog.density, fogTarget, 0.03);
     bgCurrent.lerp(bgTarget, 0.02);
