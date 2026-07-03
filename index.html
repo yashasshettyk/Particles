@@ -95,7 +95,15 @@
   }
   .divider{ width:1px; align-self:stretch; background:var(--panel-border); }
 
-  #modes{ display:flex; gap:0.5vw; }
+  #modes{
+    display:flex;
+    gap:0.5vw;
+    max-width:min(66vw, 980px);
+    overflow-x:auto;
+    overflow-y:hidden;
+    padding-bottom:0.15vh;
+    scrollbar-width:thin;
+  }
   .mode-btn{
     display:flex; flex-direction:column; align-items:center; gap:0.3vh;
     padding:0.9vh 0.9vw;
@@ -109,6 +117,7 @@
     letter-spacing:0.03vw;
     transition:background .25s ease, color .25s ease, border-color .25s ease, transform .2s ease;
     outline:none;
+    flex:0 0 auto;
   }
   .mode-btn .glyph{ font-size:1.15vw; line-height:1; }
   .mode-btn:hover{ background:rgba(255,255,255,0.06); color:var(--text-hi); transform:translateY(-2px); }
@@ -892,19 +901,399 @@
     };
   }
 
+  // ---------- ORBIT FIELD ----------
+  function buildOrbitField(baseCount, cfg){
+    cfg = cfg || {};
+    var n = Math.round(clamp(baseCount * (cfg.mult || 0.52), cfg.min || 1800, cfg.max || 7600));
+    var pos = new Float32Array(n*3);
+    var col = new Float32Array(n*3);
+    var ringIndex = new Uint8Array(n);
+    var phase = new Float32Array(n);
+    var radius = new Float32Array(n);
+    var heightSeed = new Float32Array(n);
+    var ringCount = cfg.rings || 8;
+    var hueBase = cfg.hueBase || 0.56;
+    var hueSpread = cfg.hueSpread || 0.22;
+    var ringSize = cfg.radius || 78;
+    var heightScale = cfg.height || 26;
+    var turns = cfg.turns || 2.1;
+
+    for (var i=0;i<n;i++){
+      var ri = i % ringCount;
+      ringIndex[i] = ri;
+      phase[i] = rand(0, Math.PI*2);
+      var layer = ri / Math.max(1, ringCount - 1);
+      radius[i] = ringSize * (0.22 + layer * 0.78);
+      heightSeed[i] = rand(-1, 1);
+      var a = (i / Math.max(1, n - 1)) * Math.PI * 2 * turns + ri * 0.52;
+      pos[i*3] = Math.cos(a) * radius[i];
+      pos[i*3+1] = Math.sin(a * (cfg.heightWarp || 1.6) + phase[i]) * heightScale * (0.35 + layer * 0.75);
+      pos[i*3+2] = Math.sin(a) * radius[i];
+      var c = hsl(hueBase + layer * hueSpread, 0.76, clamp(0.48 + layer * 0.18, 0.32, 0.86));
+      col[i*3] = c.r; col[i*3+1] = c.g; col[i*3+2] = c.b;
+    }
+
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos,3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col,3));
+    var mat = new THREE.PointsMaterial({
+      size:2.0, map:spriteTex, vertexColors:true, transparent:true,
+      depthWrite:false, blending:THREE.AdditiveBlending, opacity:1, sizeAttenuation:true
+    });
+    var points = new THREE.Points(geo, mat);
+    if (cfg.rotationX) points.rotation.x = cfg.rotationX;
+    if (cfg.rotationY) points.rotation.y = cfg.rotationY;
+    if (cfg.rotationZ) points.rotation.z = cfg.rotationZ;
+    activeGroup.add(points);
+
+    return {
+      material:mat,
+      update:function(t,dt,speed){
+        var arr = geo.attributes.position.array;
+        var audio = cfg.audio ? audioState.smoothLevel : 0;
+        var pointerX = pointer.x;
+        var pointerY = pointer.y;
+        for (var i=0;i<n;i++){
+          var ri = ringIndex[i];
+          var layer = ri / Math.max(1, ringCount - 1);
+          var r = radius[i] + Math.sin(t * (0.6 + layer * 0.5) + phase[i]) * (cfg.pulse || 6) + audio * (cfg.audioPull || 14);
+          var a = phase[i] + t * speed * (cfg.spin || 0.24) + ri * 0.45;
+          var y = Math.sin(a * (cfg.heightWarp || 1.6) + heightSeed[i]) * heightScale * (0.35 + layer * 0.75);
+          arr[i*3] = Math.cos(a) * r + pointerX * (cfg.pointerPullX || 18) * (1 - layer);
+          arr[i*3+1] = y - pointerY * (cfg.pointerPullY || 12) * layer;
+          arr[i*3+2] = Math.sin(a) * r;
+          phase[i] += dt * speed * (cfg.spinJitter || 0.18) * (0.7 + layer * 0.6);
+        }
+        geo.attributes.position.needsUpdate = true;
+        points.rotation.y = lerp(points.rotation.y, pointerX * (cfg.lookX || 0.32), 0.03);
+        points.rotation.x = lerp(points.rotation.x, -pointerY * (cfg.lookY || 0.16), 0.03);
+      }
+    };
+  }
+
+  // ---------- SURFACE FIELD ----------
+  function buildSurfaceField(baseCount, cfg){
+    cfg = cfg || {};
+    var nx = Math.round(Math.sqrt(baseCount * (cfg.gridScale || 1.0) * 1.2));
+    var nz = Math.max(8, Math.round(nx * (cfg.aspect || 1)));
+    var n = nx * nz;
+    var pos = new Float32Array(n*3);
+    var col = new Float32Array(n*3);
+    var gridX = new Float32Array(n);
+    var gridZ = new Float32Array(n);
+    var phase = new Float32Array(n);
+    var spacing = cfg.spacing || 4.0;
+    var width = nx * spacing * 0.5;
+    var depth = nz * spacing * 0.5;
+    var hueBase = cfg.hueBase || 0.48;
+    var hueSpread = cfg.hueSpread || 0.2;
+
+    var index = 0;
+    for (var ix=0; ix<nx; ix++){
+      for (var iz=0; iz<nz; iz++){
+        var x = ix * spacing - width;
+        var z = iz * spacing - depth;
+        gridX[index] = x;
+        gridZ[index] = z;
+        phase[index] = rand(0, Math.PI*2);
+        pos[index*3] = x;
+        pos[index*3+1] = 0;
+        pos[index*3+2] = z;
+        var c = hsl(hueBase + ((ix + iz) / Math.max(1, nx + nz)) * hueSpread, 0.8, 0.58);
+        col[index*3] = c.r; col[index*3+1] = c.g; col[index*3+2] = c.b;
+        index++;
+      }
+    }
+
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos,3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col,3));
+    var mat = new THREE.PointsMaterial({
+      size:2.0, map:spriteTex, vertexColors:true, transparent:true,
+      depthWrite:false, blending:THREE.AdditiveBlending, opacity:1, sizeAttenuation:true
+    });
+    var points = new THREE.Points(geo, mat);
+    points.rotation.x = cfg.rotationX || -0.55;
+    points.rotation.y = cfg.rotationY || 0;
+    points.position.y = cfg.yOffset || -18;
+    activeGroup.add(points);
+
+    return {
+      material:mat,
+      update:function(t,dt,speed){
+        var arr = geo.attributes.position.array;
+        var carr = geo.attributes.color.array;
+        var pointerScaleX = (pointer.x * 0.5 + 0.5) * (cfg.pointerSpanX || 34);
+        var pointerScaleZ = (pointer.y * 0.5 + 0.5) * (cfg.pointerSpanZ || 34);
+        var audio = cfg.audio ? audioState.smoothLevel : 0;
+        for (var i=0;i<n;i++){
+          var x = gridX[i];
+          var z = gridZ[i];
+          var ripple = Math.sin(x * (cfg.freqX || 0.042) + t * (cfg.speedX || 0.9) + phase[i]) * (cfg.ampX || 12);
+          ripple += Math.cos(z * (cfg.freqZ || 0.055) - t * (cfg.speedZ || 0.72) + phase[i] * 0.7) * (cfg.ampZ || 10);
+          var px = x - pointerScaleX;
+          var pz = z + pointerScaleZ;
+          var dist = Math.sqrt(px*px + pz*pz);
+          ripple += Math.cos(dist * (cfg.rippleFreq || 0.12) - t * (cfg.rippleSpeed || 1.4)) * (cfg.pointerLift || 9) / (1 + dist * 0.055);
+          ripple += audio * (cfg.audioLift || 16);
+          arr[i*3] = x;
+          arr[i*3+1] = ripple;
+          arr[i*3+2] = z;
+          var norm = clamp((ripple + 30) / 60, 0, 1);
+          var c = hsl(hueBase + norm * hueSpread, 0.78, clamp(0.34 + norm * 0.32, 0.2, 0.8));
+          carr[i*3] = c.r; carr[i*3+1] = c.g; carr[i*3+2] = c.b;
+        }
+        geo.attributes.position.needsUpdate = true;
+        geo.attributes.color.needsUpdate = true;
+        points.rotation.y = lerp(points.rotation.y, pointer.x * (cfg.lookY || 0.12), 0.03);
+      }
+    };
+  }
+
+  // ---------- STREAM FIELD ----------
+  function buildStreamField(baseCount, cfg){
+    cfg = cfg || {};
+    var n = Math.round(clamp(baseCount * (cfg.mult || 0.48), cfg.min || 2200, cfg.max || 7200));
+    var pos = new Float32Array(n*3);
+    var col = new Float32Array(n*3);
+    var lane = new Float32Array(n);
+    var phase = new Float32Array(n);
+    var velocity = new Float32Array(n);
+    var spread = cfg.spread || 110;
+    var depth = cfg.depth || 260;
+    var axis = cfg.axis || 'z';
+    var hueBase = cfg.hueBase || 0.6;
+    var hueSpread = cfg.hueSpread || 0.12;
+
+    for (var i=0;i<n;i++){
+      lane[i] = rand(-1, 1);
+      phase[i] = rand(0, Math.PI*2);
+      velocity[i] = rand(cfg.minVelocity || 26, cfg.maxVelocity || 110);
+      if (axis === 'x'){
+        pos[i*3] = rand(-depth, depth);
+        pos[i*3+1] = rand(-spread, spread);
+        pos[i*3+2] = rand(-spread, spread);
+      } else if (axis === 'y'){
+        pos[i*3] = rand(-spread, spread);
+        pos[i*3+1] = rand(-depth, depth);
+        pos[i*3+2] = rand(-spread, spread);
+      } else {
+        pos[i*3] = rand(-spread, spread);
+        pos[i*3+1] = rand(-spread, spread);
+        pos[i*3+2] = rand(-depth, depth);
+      }
+      var c = hsl(hueBase + lane[i] * hueSpread, 0.76, 0.64);
+      col[i*3] = c.r; col[i*3+1] = c.g; col[i*3+2] = c.b;
+    }
+
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos,3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col,3));
+    var mat = new THREE.PointsMaterial({
+      size:2.0, map:spriteTex, vertexColors:true, transparent:true,
+      depthWrite:false, blending:THREE.AdditiveBlending, opacity:1, sizeAttenuation:true
+    });
+    var points = new THREE.Points(geo, mat);
+    points.rotation.y = cfg.rotationY || 0;
+    points.rotation.x = cfg.rotationX || 0;
+    activeGroup.add(points);
+
+    function respawn(i){
+      lane[i] = rand(-1, 1);
+      phase[i] = rand(0, Math.PI*2);
+      velocity[i] = rand(cfg.minVelocity || 26, cfg.maxVelocity || 110);
+      if (axis === 'x'){
+        pos[i*3] = -depth;
+        pos[i*3+1] = rand(-spread, spread);
+        pos[i*3+2] = rand(-spread, spread);
+      } else if (axis === 'y'){
+        pos[i*3] = rand(-spread, spread);
+        pos[i*3+1] = -depth;
+        pos[i*3+2] = rand(-spread, spread);
+      } else {
+        pos[i*3] = rand(-spread, spread);
+        pos[i*3+1] = rand(-spread, spread);
+        pos[i*3+2] = -depth;
+      }
+    }
+
+    return {
+      material:mat,
+      update:function(t,dt,speed){
+        var arr = geo.attributes.position.array;
+        var audio = cfg.audio ? audioState.smoothLevel : 0;
+        var pullX = pointer.x * (cfg.pointerPull || 20);
+        var pullY = pointer.y * (cfg.pointerPull || 20);
+        for (var i=0;i<n;i++){
+          var s = velocity[i] * dt * speed * (cfg.speedScale || 1);
+          phase[i] += dt * speed * (0.6 + Math.abs(lane[i]) * 0.35);
+          if (axis === 'x'){
+            pos[i*3] += s;
+            pos[i*3+1] = Math.sin(phase[i] + t * 0.8) * (cfg.wobble || 20) + pullY * 10;
+            pos[i*3+2] = Math.cos(phase[i] + t * 0.7) * (cfg.wobble || 20) + pullX * 10;
+            if (pos[i*3] > depth) respawn(i);
+          } else if (axis === 'y'){
+            pos[i*3+1] += s;
+            pos[i*3] = Math.sin(phase[i] + t * 0.8) * (cfg.wobble || 20) + pullX * 10;
+            pos[i*3+2] = Math.cos(phase[i] + t * 0.7) * (cfg.wobble || 20) + pullY * 10;
+            if (pos[i*3+1] > depth) respawn(i);
+          } else {
+            pos[i*3+2] += s;
+            pos[i*3] = Math.sin(phase[i] + t * 0.8) * (cfg.wobble || 20) + pullX * 10;
+            pos[i*3+1] = Math.cos(phase[i] + t * 0.7) * (cfg.wobble || 20) - pullY * 10;
+            if (pos[i*3+2] > depth) respawn(i);
+          }
+          if (cfg.audio){
+            var burst = audio * (cfg.audioBurst || 18);
+            pos[i*3] += Math.sin(phase[i] * 2.2 + t) * burst * 0.02;
+            pos[i*3+1] += Math.cos(phase[i] * 1.7 + t) * burst * 0.02;
+          }
+          arr[i*3] = pos[i*3];
+          arr[i*3+1] = pos[i*3+1];
+          arr[i*3+2] = pos[i*3+2];
+        }
+        geo.attributes.position.needsUpdate = true;
+        points.rotation.z = lerp(points.rotation.z, pointer.x * (cfg.lookZ || 0.18), 0.03);
+      }
+    };
+  }
+
+  // ---------- RADIAL FIELD ----------
+  function buildRadialField(baseCount, cfg){
+    cfg = cfg || {};
+    var n = Math.round(clamp(baseCount * (cfg.mult || 0.5), cfg.min || 2200, cfg.max || 7800));
+    var pos = new Float32Array(n*3);
+    var col = new Float32Array(n*3);
+    var ring = new Uint8Array(n);
+    var theta = new Float32Array(n);
+    var radius = new Float32Array(n);
+    var phase = new Float32Array(n);
+    var ringCount = cfg.rings || 10;
+    var hueBase = cfg.hueBase || 0.55;
+    var hueSpread = cfg.hueSpread || 0.2;
+
+    for (var i=0;i<n;i++){
+      var ri = i % ringCount;
+      ring[i] = ri;
+      var layer = ri / Math.max(1, ringCount - 1);
+      theta[i] = (i / Math.max(1, n - 1)) * Math.PI * 2 * (cfg.turns || 3.0) + ri * 0.37;
+      radius[i] = (cfg.radius || 50) * (0.3 + layer * 0.75);
+      phase[i] = rand(0, Math.PI*2);
+      pos[i*3] = Math.cos(theta[i]) * radius[i];
+      pos[i*3+1] = Math.sin(theta[i] * (cfg.petals || 2.0)) * (cfg.height || 14) * (0.4 + layer * 0.7);
+      pos[i*3+2] = Math.sin(theta[i]) * radius[i];
+      var c = hsl(hueBase + layer * hueSpread, 0.8, 0.6);
+      col[i*3] = c.r; col[i*3+1] = c.g; col[i*3+2] = c.b;
+    }
+
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos,3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col,3));
+    var mat = new THREE.PointsMaterial({
+      size:2.1, map:spriteTex, vertexColors:true, transparent:true,
+      depthWrite:false, blending:THREE.AdditiveBlending, opacity:1, sizeAttenuation:true
+    });
+    var points = new THREE.Points(geo, mat);
+    if (cfg.rotationX) points.rotation.x = cfg.rotationX;
+    if (cfg.rotationY) points.rotation.y = cfg.rotationY;
+    if (cfg.rotationZ) points.rotation.z = cfg.rotationZ;
+    activeGroup.add(points);
+
+    return {
+      material:mat,
+      update:function(t,dt,speed){
+        var arr = geo.attributes.position.array;
+        var audio = cfg.audio ? audioState.smoothLevel : 0;
+        var pointerX = pointer.x;
+        var pointerY = pointer.y;
+        for (var i=0;i<n;i++){
+          var layer = ring[i] / Math.max(1, ringCount - 1);
+          theta[i] += dt * speed * (cfg.spin || 0.3) * (0.7 + layer * 0.8);
+          var r = radius[i] + Math.sin(t * (cfg.breathe || 0.8) + phase[i]) * (cfg.pulse || 6) + audio * (cfg.audioPull || 14);
+          var petals = cfg.petals || 2.0;
+          var x = Math.cos(theta[i]) * r;
+          var y = Math.sin(theta[i] * petals + phase[i]) * (cfg.height || 14) * (0.4 + layer * 0.7);
+          var z = Math.sin(theta[i]) * r;
+          x += pointerX * (cfg.pointerX || 12) * (1 - layer);
+          y -= pointerY * (cfg.pointerY || 10) * layer;
+          z += Math.sin(t * 0.35 + phase[i]) * (cfg.depthWobble || 4);
+          arr[i*3] = x;
+          arr[i*3+1] = y;
+          arr[i*3+2] = z;
+        }
+        geo.attributes.position.needsUpdate = true;
+        points.rotation.y = lerp(points.rotation.y, pointerX * (cfg.lookY || 0.28), 0.03);
+        points.rotation.x = lerp(points.rotation.x, -pointerY * (cfg.lookX || 0.14), 0.03);
+      }
+    };
+  }
+
   /* ============================================================
      MODE REGISTRY
   ============================================================ */
-  var MODES = [
-    { key:'pulse',         name:'Pulse',         glyph:'◉', build:buildPulse,         base:9800,  cam:210, fog:0.0014, bg:0x04040a },
-    { key:'galaxy',        name:'Galaxy',        glyph:'✦', build:buildGalaxy,        base:11000, cam:260, fog:0.0015, bg:0x050308 },
-    { key:'nebula',        name:'Nebula',        glyph:'❄', build:buildNebula,        base:8000,  cam:220, fog:0.0020, bg:0x08040a },
-    { key:'sphere',        name:'Sphere',        glyph:'◯', build:buildSphere,        base:9000,  cam:230, fog:0.0014, bg:0x020508 },
-    { key:'flow',          name:'Flow',          glyph:'≈', build:buildFlow,          base:9200,  cam:200, fog:0.0017, bg:0x020306 },
-    { key:'warp',          name:'Warp',          glyph:'≫', build:buildWarp,          base:11000, cam:0,   fog:0.0000, bg:0x000000 },
-    { key:'aurora',        name:'Aurora',        glyph:'∿', build:buildAurora,        base:9000,  cam:140, fog:0.0022, bg:0x020604 },
-    { key:'constellation', name:'Constellation', glyph:'∴', build:buildConstellation, base:9000,  cam:240, fog:0.0012, bg:0x020204 }
-  ];
+  var MODES = [];
+  function addMode(def){ MODES.push(def); }
+  function addPresetModes(presets, builder, family){
+    presets.forEach(function(p){
+      addMode({
+        key:p.key,
+        name:p.name,
+        glyph:p.glyph,
+        build:function(count){ return builder(count, p); },
+        base:p.base,
+        cam:p.cam,
+        fog:p.fog,
+        bg:p.bg,
+        family:family
+      });
+    });
+  }
+
+  addMode({ key:'pulse', name:'Pulse', glyph:'◉', build:buildPulse, base:9800, cam:210, fog:0.0014, bg:0x04040a, family:'core' });
+  addMode({ key:'galaxy', name:'Galaxy', glyph:'✦', build:buildGalaxy, base:11000, cam:260, fog:0.0015, bg:0x050308, family:'core' });
+  addMode({ key:'nebula', name:'Nebula', glyph:'❄', build:buildNebula, base:8000, cam:220, fog:0.0020, bg:0x08040a, family:'core' });
+  addMode({ key:'sphere', name:'Sphere', glyph:'◯', build:buildSphere, base:9000, cam:230, fog:0.0014, bg:0x020508, family:'core' });
+  addMode({ key:'flow', name:'Flow', glyph:'≈', build:buildFlow, base:9200, cam:200, fog:0.0017, bg:0x020306, family:'core' });
+  addMode({ key:'warp', name:'Warp', glyph:'≫', build:buildWarp, base:11000, cam:0, fog:0.0000, bg:0x000000, family:'core' });
+  addMode({ key:'aurora', name:'Aurora', glyph:'∿', build:buildAurora, base:9000, cam:140, fog:0.0022, bg:0x020604, family:'core' });
+  addMode({ key:'constellation', name:'Constellation', glyph:'∴', build:buildConstellation, base:9000, cam:240, fog:0.0012, bg:0x020204, family:'core' });
+
+  addPresetModes([
+    { key:'halo', name:'Halo', glyph:'◌', base:8200, cam:220, fog:0.0014, bg:0x04050c, radius:74, rings:8, turns:2.2, hueBase:0.58, hueSpread:0.18, spin:0.22, pulse:5, audio:true, rotationX:-0.36 },
+    { key:'spiral', name:'Spiral', glyph:'↺', base:8600, cam:230, fog:0.0015, bg:0x05040a, radius:82, rings:10, turns:3.8, hueBase:0.60, hueSpread:0.16, spin:0.27, pulse:7, audio:true, rotationX:-0.24 },
+    { key:'gyro', name:'Gyro', glyph:'⟲', base:7800, cam:200, fog:0.0016, bg:0x040308, radius:68, rings:9, turns:1.6, hueBase:0.54, hueSpread:0.24, spin:0.34, pulse:6, rotationY:0.36 },
+    { key:'satellite', name:'Satellite', glyph:'⟡', base:7600, cam:210, fog:0.0014, bg:0x02040a, radius:64, rings:7, turns:2.8, hueBase:0.52, hueSpread:0.14, spin:0.2, pulse:4, rotationZ:0.26 },
+    { key:'crown', name:'Crown', glyph:'♛', base:8400, cam:225, fog:0.0015, bg:0x050509, radius:72, rings:8, turns:2.0, hueBase:0.08, hueSpread:0.16, spin:0.25, pulse:7, audio:true, rotationX:-0.58 },
+    { key:'orbit', name:'Orbit', glyph:'◎', base:8000, cam:210, fog:0.0014, bg:0x02040b, radius:88, rings:12, turns:3.2, hueBase:0.56, hueSpread:0.2, spin:0.23, pulse:5, rotationY:0.22 }
+  ], buildOrbitField, 'orbit');
+
+  addPresetModes([
+    { key:'lattice', name:'Lattice', glyph:'#', base:8800, cam:210, fog:0.0018, bg:0x020408, spacing:4.4, aspect:1.0, hueBase:0.56, hueSpread:0.12, freqX:0.04, freqZ:0.06, ampX:12, ampZ:8, rippleFreq:0.12, rippleSpeed:1.2, pointerLift:10, audioLift:14, rotationX:-0.62 },
+    { key:'ripple', name:'Ripple', glyph:'≈', base:9000, cam:205, fog:0.0018, bg:0x04050b, spacing:4.0, aspect:1.15, hueBase:0.50, hueSpread:0.18, freqX:0.06, freqZ:0.04, ampX:15, ampZ:9, rippleFreq:0.15, rippleSpeed:1.5, pointerLift:12, audioLift:18, rotationX:-0.58 },
+    { key:'tide', name:'Tide', glyph:'∿', base:8400, cam:220, fog:0.0017, bg:0x020507, spacing:4.6, aspect:1.35, hueBase:0.44, hueSpread:0.14, freqX:0.035, freqZ:0.05, ampX:10, ampZ:12, rippleFreq:0.1, rippleSpeed:1.0, pointerLift:8, audioLift:12, rotationX:-0.72 },
+    { key:'circuit', name:'Circuit', glyph:'⌬', base:8600, cam:215, fog:0.0017, bg:0x02060a, spacing:4.1, aspect:1.0, hueBase:0.58, hueSpread:0.1, freqX:0.08, freqZ:0.03, ampX:8, ampZ:15, rippleFreq:0.13, rippleSpeed:1.7, pointerLift:9, audioLift:15, rotationX:-0.48 },
+    { key:'mirage', name:'Mirage', glyph:'◫', base:8000, cam:200, fog:0.0019, bg:0x07050a, spacing:4.7, aspect:1.2, hueBase:0.78, hueSpread:0.12, freqX:0.03, freqZ:0.03, ampX:13, ampZ:13, rippleFreq:0.11, rippleSpeed:1.25, pointerLift:11, audioLift:12, rotationX:-0.68 },
+    { key:'terrain', name:'Terrain', glyph:'⛰', base:9200, cam:225, fog:0.0016, bg:0x030608, spacing:4.2, aspect:1.25, hueBase:0.33, hueSpread:0.1, freqX:0.045, freqZ:0.045, ampX:16, ampZ:14, rippleFreq:0.09, rippleSpeed:1.05, pointerLift:14, audioLift:16, rotationX:-0.72 }
+  ], buildSurfaceField, 'surface');
+
+  addPresetModes([
+    { key:'rain', name:'Rain', glyph:'⋮', base:8600, cam:200, fog:0.0015, bg:0x020406, axis:'y', spread:120, depth:260, hueBase:0.58, hueSpread:0.08, minVelocity:65, maxVelocity:135, wobble:14, lookZ:0.16 },
+    { key:'snow', name:'Snow', glyph:'❅', base:7600, cam:190, fog:0.0014, bg:0x05080a, axis:'y', spread:130, depth:240, hueBase:0.58, hueSpread:0.06, minVelocity:24, maxVelocity:58, wobble:20, lookZ:0.14 },
+    { key:'ember', name:'Ember', glyph:'✹', base:8200, cam:205, fog:0.0013, bg:0x080305, axis:'y', spread:110, depth:250, hueBase:0.04, hueSpread:0.08, minVelocity:42, maxVelocity:98, wobble:18, lookZ:0.18, audio:true, audioBurst:20 },
+    { key:'comet', name:'Comet', glyph:'☄', base:7800, cam:210, fog:0.0012, bg:0x020309, axis:'z', spread:100, depth:280, hueBase:0.56, hueSpread:0.14, minVelocity:78, maxVelocity:150, wobble:16, lookZ:0.22 },
+    { key:'veil', name:'Veil', glyph:'◒', base:8400, cam:195, fog:0.0017, bg:0x04040a, axis:'x', spread:120, depth:280, hueBase:0.76, hueSpread:0.08, minVelocity:28, maxVelocity:68, wobble:24, lookZ:0.12 },
+    { key:'torrent', name:'Torrent', glyph:'≋', base:9000, cam:205, fog:0.0015, bg:0x02060a, axis:'z', spread:125, depth:300, hueBase:0.53, hueSpread:0.12, minVelocity:90, maxVelocity:160, wobble:18, lookZ:0.2, audio:true, audioBurst:16 }
+  ], buildStreamField, 'stream');
+
+  addPresetModes([
+    { key:'ring', name:'Ring', glyph:'◯', base:8600, cam:215, fog:0.0014, bg:0x040508, radius:58, rings:10, turns:3.2, hueBase:0.56, hueSpread:0.12, spin:0.26, pulse:5, petals:1.0, height:12, rotationX:-0.5 },
+    { key:'bloom', name:'Bloom', glyph:'✿', base:9000, cam:210, fog:0.0015, bg:0x06040a, radius:54, rings:11, turns:2.6, hueBase:0.82, hueSpread:0.16, spin:0.3, pulse:7, petals:4.5, height:18, rotationX:-0.44, audio:true },
+    { key:'petal', name:'Petal', glyph:'❁', base:8400, cam:200, fog:0.0016, bg:0x05060a, radius:62, rings:9, turns:3.4, hueBase:0.1, hueSpread:0.16, spin:0.22, pulse:6, petals:6.0, height:14, rotationX:-0.36 },
+    { key:'nova', name:'Nova', glyph:'✦', base:9200, cam:230, fog:0.0013, bg:0x020308, radius:64, rings:12, turns:3.0, hueBase:0.55, hueSpread:0.24, spin:0.34, pulse:10, petals:3.0, height:16, audio:true, rotationY:0.18 },
+    { key:'shard', name:'Shard', glyph:'◇', base:8600, cam:220, fog:0.0012, bg:0x030205, radius:68, rings:10, turns:2.0, hueBase:0.0, hueSpread:0.1, spin:0.18, pulse:8, petals:8.0, height:10, rotationZ:0.28 },
+    { key:'disk', name:'Disk', glyph:'◎', base:9000, cam:210, fog:0.0014, bg:0x02060b, radius:70, rings:12, turns:2.8, hueBase:0.52, hueSpread:0.18, spin:0.28, pulse:5, petals:2.0, height:12, audio:true, rotationX:-0.58 }
+  ], buildRadialField, 'radial');
+
   var modeByKey = {};
   MODES.forEach(function(m){ modeByKey[m.key]=m; });
 
